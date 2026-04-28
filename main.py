@@ -13,6 +13,7 @@ Run locally:
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 
 from dotenv import load_dotenv
@@ -35,24 +36,19 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS: explicit origins because the Angular dev server lives on a
-# different port. Browsers reject `allow_origins=["*"]` together with
-# credentials, and they also drop the `Authorization` header when the
-# response wildcard mismatches — so we list the dev origin explicitly
-# and skip credentials (we authenticate via header, not cookies).
+_DEFAULT_ORIGINS = "http://localhost:4200,http://127.0.0.1:4200"
+_ALLOWED_ORIGINS = {
+    o.strip() for o in os.getenv("CORS_ORIGINS", _DEFAULT_ORIGINS).split(",") if o.strip()
+}
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:4200",
-        "http://127.0.0.1:4200",
-    ],
+    allow_origins=sorted(_ALLOWED_ORIGINS),
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
     allow_credentials=False,
 )
 
-
-_ALLOWED_ORIGINS = {"http://localhost:4200", "http://127.0.0.1:4200"}
 _log = logging.getLogger("ai-service")
 
 
