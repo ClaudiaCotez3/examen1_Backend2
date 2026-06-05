@@ -15,8 +15,10 @@ contexts would leak diagram talk into form filling.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any
 
 from ai_chat import _anthropic_client, _model_name
@@ -115,16 +117,24 @@ def _build_system_prompt(
         "\n".join(f"- {k}: {v!r}" for k, v in (current_values or {}).items())
         or "  (todos los campos están vacíos)"
     )
+    today = date.today()
+    today_block = today.strftime("%Y-%m-%d")
 
     return f"""Eres "Asistente de formularios" de un sistema de tareas. Hablas
 SIEMPRE en español, en tono natural y breve, como un colega ayudando.
 No uses jerga técnica ("campo", "control", "form"); usa los nombres
 visibles para el usuario (las "etiquetas" de cada campo).
 
+FECHA DE HOY: {today_block}
+
 OBJETIVO
 Cada turno el operador te dirá (por voz o texto) qué información quiere
-escribir en el formulario. Tú debes devolver el diccionario `values` con
-las parejas {{ nombre: valor }} que el frontend escribirá en los campos.
+escribir en el formulario. Suele ser un DICTADO NARRADO completo, por
+ejemplo: "Hola, soy Juan Pérez. Realicé la inspección el día 20 de junio.
+Visité la vivienda en la avenida Busch número 125. La instalación fue
+correcta. No se requiere reparación." Tu trabajo es repartir TODA esa
+información entre los campos correctos en un solo turno. Devuelve el
+diccionario `values` con las parejas {{ nombre: valor }}.
 
 REGLAS DURAS
 1. Usa SIEMPRE los nombres EXACTOS de la sección "CAMPOS DEL FORMULARIO".
@@ -133,17 +143,35 @@ REGLAS DURAS
 2. Solo incluye en `values` los campos que vas a cambiar este turno.
    Si un campo ya tiene el valor correcto, no lo repitas.
 3. Respeta el TIPO declarado del campo:
-   - text / textarea / date / datetime → string
-   - number → número (no string)
-   - checkbox → true / false
-   - select / radio → uno de los valores listados en `opciones`
-   - tags → array de strings
-4. Si el operador pide algo ambiguo o falta información para un campo
-   obligatorio, devuelve `values: {{}}` y pídele la información en `reply`.
-5. Si el operador adjunta una imagen (foto de un documento, recibo,
+   - text / textarea → string
+   - date → string en formato ISO "YYYY-MM-DD" SIEMPRE. Si el operador
+     dice "el 20 de junio" sin año, usa el año de la FECHA DE HOY.
+     "Ayer" / "hoy" / "mañana" se resuelven contra la FECHA DE HOY.
+   - datetime → string ISO "YYYY-MM-DDTHH:mm" (misma regla para el año).
+   - number → número (no string). Convierte números en palabras a
+     dígitos ("ciento veinticinco" → 125).
+   - checkbox → true / false. ATENCIÓN a las negaciones del español:
+     "NO se requiere reparación", "sin inconvenientes", "no aplica"
+     → false. Afirmaciones ("sí se necesita", "requiere revisión")
+     → true. Una negación explícita SÍ es información: llena el campo
+     con false, no lo dejes vacío.
+   - select / radio → EXACTAMENTE uno de los valores listados en
+     `opciones`. Si el operador parafrasea ("la instalación fue
+     realizada correctamente"), elige la opción MÁS CERCANA en
+     significado (p. ej. "Instalado correctamente"). NUNCA inventes una
+     opción nueva ni copies la frase literal del operador.
+   - tags → array de strings.
+4. Frases de identidad como "soy Juan Pérez" o "mi nombre es..." van al
+   campo de nombre del técnico/operador/responsable si el formulario
+   tiene uno. Direcciones dictadas ("avenida Busch número 125") se
+   escriben en forma compacta habitual ("Av. Busch #125").
+5. Si una parte del dictado es ambigua, llena los campos claros y pide
+   en `reply` SOLO lo que falte. Devuelve `values: {{}}` únicamente
+   cuando no haya nada interpretable.
+6. Si el operador adjunta una imagen (foto de un documento, recibo,
    formulario en papel), extrae los datos visibles y úsalos para llenar
    los campos cuando coincidan con el formulario.
-6. El `reply` confirma en lenguaje natural qué llenaste. Ejemplo bueno:
+7. El `reply` confirma en lenguaje natural qué llenaste. Ejemplo bueno:
    "Listo, anoté Pedro García como nombre y 1234 como número de medidor."
    Ejemplo malo: "He establecido el campo nombre con valor Pedro García."
 
@@ -257,13 +285,115 @@ def fill(
     raw_values = payload.get("values") or {}
     # Defensive filter — only let through field names that the schema
     # actually declares. Keeps stray hallucinations out of the form.
-    valid_names = {f.get("name") for f in fields if f.get("name")}
-    cleaned = {k: v for k, v in raw_values.items() if k in valid_names}
+    fields_by_name = {f.get("name"): f for f in fields if f.get("name")}
+    cleaned = {
+        name: _coerce_value(fields_by_name[name], value)
+        for name, value in raw_values.items()
+        if name in fields_by_name
+    }
 
     return {
         "reply": payload.get("reply", ""),
         "values": cleaned,
     }
+
+
+# ── Defensive type coercion ───────────────────────────────────────────
+#
+# Second safety net behind the prompt rules: even at temperature 0.2 the
+# model occasionally emits "true" as a string, a dd/mm/yyyy date, or a
+# select value with different casing. Coercing here keeps the Angular
+# reactive form (and the Spring validators downstream) happy without
+# bouncing the request back to the operator.
+
+_TRUTHY = {"true", "sí", "si", "yes", "1", "verdadero"}
+_FALSY = {"false", "no", "0", "falso"}
+
+_DATE_PATTERNS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y")
+
+
+def _coerce_value(field_def: dict[str, Any], value: Any) -> Any:
+    ftype = str(field_def.get("type") or "text").lower()
+
+    if ftype == "checkbox":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in _TRUTHY:
+                return True
+            if lowered in _FALSY:
+                return False
+        return bool(value)
+
+    if ftype == "number":
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            try:
+                num = float(value.replace(",", "."))
+                return int(num) if num.is_integer() else num
+            except ValueError:
+                return value
+        return value
+
+    if ftype == "date":
+        return _coerce_date(value)
+
+    if ftype in ("select", "radio"):
+        return _coerce_option(field_def.get("options") or [], value)
+
+    if ftype == "tags" and isinstance(value, str):
+        return [t.strip() for t in value.split(",") if t.strip()]
+
+    return value
+
+
+def _coerce_date(value: Any) -> Any:
+    """Normalizes common date shapes to ISO YYYY-MM-DD."""
+    if not isinstance(value, str):
+        return value
+    raw = value.strip()
+    # Already ISO (possibly with a time suffix) → keep the date part.
+    iso_match = re.match(r"^(\d{4}-\d{2}-\d{2})", raw)
+    if iso_match:
+        return iso_match.group(1)
+    for pattern in _DATE_PATTERNS:
+        try:
+            return datetime.strptime(raw, pattern).date().isoformat()
+        except ValueError:
+            continue
+    return value
+
+
+def _coerce_option(options: list[Any], value: Any) -> Any:
+    """Snaps a select/radio value onto the declared options list.
+
+    Exact match wins; then case/accent-insensitive; then substring
+    containment in either direction (handles paraphrases the prompt
+    rules didn't fully normalize). Unmatchable values pass through —
+    the Angular form simply won't select anything, which is visible
+    (and fixable) by the operator.
+    """
+    if not options or not isinstance(value, str):
+        return value
+    if value in options:
+        return value
+
+    def norm(s: Any) -> str:
+        text = str(s).strip().lower()
+        replacements = str.maketrans("áéíóúüñ", "aeiouun")
+        return text.translate(replacements)
+
+    target = norm(value)
+    for opt in options:
+        if norm(opt) == target:
+            return opt
+    for opt in options:
+        n = norm(opt)
+        if n and (n in target or target in n):
+            return opt
+    return value
 
 
 def reset(session_id: str) -> None:

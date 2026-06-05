@@ -26,6 +26,8 @@ load_dotenv()
 
 import ai_chat
 import ai_form_fill
+import intake
+import reports
 from insights import compute_bottlenecks, cluster_operators, detect_anomalies, render_summary
 from pydantic import BaseModel, Field
 from security import require_role
@@ -211,6 +213,102 @@ class FormFillRequest(BaseModel):
 class FormFillResponse(BaseModel):
     reply: str
     values: dict[str, object]
+
+
+# ── Módulo 3: Clasificación Inteligente de Trámites (app móvil) ──────
+
+
+class IntakeRequest(BaseModel):
+    """El cliente móvil se identifica con correo + CI (no tiene cuenta de
+    usuario), igual que en /api/mobile/** del backend Spring.
+
+    Modo INVITADO: un cliente nuevo que llega por "Iniciar un nuevo
+    trámite" aún no existe en la base — envía email/ci vacíos y solo
+    clasifica su necesidad; su identidad se crea recién al enviar el
+    formulario inicial (POST /api/mobile/start-case)."""
+    email: str = ""
+    ci: str = ""
+    description: str
+
+
+class IntakeAlternative(BaseModel):
+    policyId: str
+    policyName: str | None = None
+
+
+class IntakeResponse(BaseModel):
+    policyId: str | None
+    policyName: str | None
+    confidence: str
+    reply: str
+    reasoning: str
+    alternatives: list[IntakeAlternative]
+
+
+@app.post("/ai/classify-intake", response_model=IntakeResponse)
+async def ai_classify_intake(req: IntakeRequest) -> IntakeResponse:
+    from fastapi import HTTPException
+
+    # Puerta del portal móvil: si llegan credenciales, deben existir en
+    # la colección de clientes (Opción B). Credenciales VACÍAS = modo
+    # invitado (cliente nuevo clasificando su primera necesidad).
+    is_guest = not (req.email or "").strip() and not (req.ci or "").strip()
+    if not is_guest and not intake.verify_customer(req.email, req.ci):
+        raise HTTPException(status_code=401, detail="Credenciales de cliente inválidas")
+    try:
+        result = intake.classify(req.description)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        _log.exception("Anthropic intake call failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI backend error ({type(exc).__name__}): {exc}",
+        )
+    return IntakeResponse(**result)
+
+
+# ── Módulo 4: Reportes Inteligentes (supervisores) ───────────────────
+
+
+class ReportRequest(BaseModel):
+    question: str
+
+
+class ReportChart(BaseModel):
+    type: str
+    label: str
+    labels: list[str]
+    values: list[float]
+
+
+class ReportResponse(BaseModel):
+    title: str
+    summary: str
+    columns: list[str]
+    rows: list[list[str | float | int]]
+    chart: ReportChart | None = None
+    insights: list[str]
+
+
+@app.post(
+    "/ai/reports",
+    dependencies=[Depends(supervisor_only)],
+    response_model=ReportResponse,
+)
+async def ai_reports_endpoint(req: ReportRequest) -> ReportResponse:
+    from fastapi import HTTPException
+    try:
+        result = reports.generate_report(req.question)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        _log.exception("Anthropic reports call failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI backend error ({type(exc).__name__}): {exc}",
+        )
+    return ReportResponse(**result)
 
 
 @app.post(
