@@ -13,8 +13,20 @@ python -m venv .venv
 # (or: source .venv/bin/activate on Linux / macOS)
 pip install -r requirements.txt
 copy .env.example .env          # then edit if needed
-uvicorn main:app --reload --port 8001
+uvicorn main:app --reload --host 0.0.0.0 --port 8001
 ```
+
+> **`--host 0.0.0.0` es obligatorio para la app móvil en teléfono físico.**
+> Sin él, uvicorn enlaza solo a `127.0.0.1` y el servicio queda accesible
+> únicamente desde la propia PC (la web en `localhost` funciona, pero el
+> teléfono recibe «No se pudo conectar con el servidor» al clasificar un
+> trámite). El backend Spring (`:8080`) ya enlaza a todas las interfaces,
+> por eso login/consultas sí funcionan desde el teléfono.
+>
+> En Windows, además, permite el puerto 8001 entrante en el Firewall:
+> ```powershell
+> New-NetFirewallRule -DisplayName "ai-service 8001" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8001
+> ```
 
 The service expects:
 
