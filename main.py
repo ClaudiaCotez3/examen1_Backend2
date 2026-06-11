@@ -28,6 +28,7 @@ import ai_chat
 import ai_form_fill
 import intake
 import reports
+import routing_engine
 from insights import compute_bottlenecks, cluster_operators, detect_anomalies, render_summary
 from pydantic import BaseModel, Field
 from security import require_role
@@ -75,6 +76,8 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 supervisor_only = require_role(["SUPERVISOR", "ADMIN"])
 admin_only = require_role(["ADMIN"])
 operator_or_admin = require_role(["OPERATOR", "ADMIN"])
+# El motor lo consultan tanto operadores (su tablero) como supervisores.
+engine_viewer = require_role(["OPERATOR", "SUPERVISOR", "ADMIN"])
 
 
 @app.get("/healthz")
@@ -101,6 +104,45 @@ async def anomalies() -> dict:
 @app.get("/insights/summary", dependencies=[Depends(supervisor_only)])
 async def summary() -> dict:
     return render_summary()
+
+
+# ── Motor inteligente de enrutamiento y riesgos (TensorFlow) ─────────
+
+
+@app.get("/engine/status", dependencies=[Depends(supervisor_only)])
+async def engine_status() -> dict:
+    """¿Están los modelos TF entrenados/cargados? Útil para el dashboard."""
+    return routing_engine.engine_status()
+
+
+@app.get("/engine/predict/{tramite_id}", dependencies=[Depends(engine_viewer)])
+async def engine_predict(tramite_id: str) -> dict:
+    """Demora, riesgo y prioridad de un trámite en curso."""
+    return routing_engine.predict_case(tramite_id)
+
+
+@app.get("/engine/priorities", dependencies=[Depends(supervisor_only)])
+async def engine_priorities(limit: int = 20) -> dict:
+    """Cola de trámites activos ordenada por prioridad (riesgo × demora)."""
+    return routing_engine.priorities(limit=limit)
+
+
+@app.get("/engine/anomalies", dependencies=[Depends(supervisor_only)])
+async def engine_anomalies() -> dict:
+    """Anomalías de duración detectadas con el autoencoder TensorFlow."""
+    return routing_engine.detect_anomalies_tf()
+
+
+class AssignmentRequest(BaseModel):
+    activityId: str
+    candidateOperatorIds: list[str] = Field(default_factory=list)
+
+
+@app.post("/engine/recommend-assignment", dependencies=[Depends(supervisor_only)])
+async def engine_recommend_assignment(req: AssignmentRequest) -> dict:
+    """Recomienda a qué operador asignar una actividad para minimizar la
+    demora esperada (el 'enrutamiento' real: a quién va la tarea)."""
+    return routing_engine.recommend_assignment(req.activityId, req.candidateOperatorIds)
 
 
 # ── Policy-designer chat assistant ───────────────────────────────────

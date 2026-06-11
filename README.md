@@ -45,3 +45,49 @@ All `/insights/*` routes require `Authorization: Bearer <jwt>` with
 * **Anomaly detection** — `IsolationForest(contamination=0.1)` on the
   per-instance lead time of every finalised activity. Outliers are
   reported with their `caseId` and time taken.
+
+## Motor inteligente de enrutamiento y riesgos (TensorFlow)
+
+Módulo del Parcial 2. Tres modelos Keras entrenados sobre el historial de
+`instancias_actividad` predicen, por trámite/actividad: **demora** (ETA),
+**riesgo** de atraso, **prioridad** (derivada) y **anomalías**; y
+recomiendan la **mejor asignación** de operador.
+
+### Entrenar (offline)
+
+```bash
+# Con datos reales de Mongo:
+python train_models.py
+# Demo / poco historial — genera 800 muestras sintéticas en memoria:
+python train_models.py --synthetic 800 --epochs 40
+```
+
+Esto guarda `eta.keras`, `risk.keras`, `anomaly.keras` y `encoders.json`
+en `MODELS_DIR` (por defecto `./models`). El servicio solo los **carga e
+infiere**; nunca reentrena en caliente. Si aún no hay modelos, los
+endpoints responden con una heurística transparente (`model: "heuristic"`).
+
+### Endpoints
+
+| Route | Rol | Returns |
+| ----- | --- | ------- |
+| `GET /engine/status` | SUP/ADMIN | Si los modelos TF están entrenados/cargados. |
+| `GET /engine/predict/{tramiteId}` | OP/SUP/ADMIN | ETA, riesgo y prioridad de un trámite en curso. |
+| `GET /engine/priorities?limit=20` | SUP/ADMIN | Cola de activos ordenada por riesgo × demora. |
+| `GET /engine/anomalies` | SUP/ADMIN | Anomalías de duración vía autoencoder TF. |
+| `POST /engine/recommend-assignment` | SUP/ADMIN | Mejor operador para una actividad (`{activityId, candidateOperatorIds}`). |
+
+### Modelos
+
+* **ETA / demora** — red densa con *embeddings* de actividad, operador y
+  calle + features numéricos (hora/día cíclicos, backlog). Objetivo
+  `log1p(minutos)`, pérdida MSE.
+* **Riesgo** — mismo tronco, cabeza sigmoide. Etiqueta = el lead superó
+  `mediana_actividad × 1.5`.
+* **Anomalías** — autoencoder sobre `(lead, wait, service)`; umbral =
+  `media + 2σ` del error de reconstrucción. Reemplaza/complementa al
+  IsolationForest.
+* **Mejor asignación** — corre el modelo de ETA para cada operador
+  candidato y recomienda el de menor demora esperada. No decide la rama
+  sí/no de un nodo DECISION (eso lo define la regla de negocio); optimiza
+  **a quién** se enruta la tarea.

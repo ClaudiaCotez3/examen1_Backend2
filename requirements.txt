@@ -4,6 +4,8 @@ pymongo==4.10.1
 scikit-learn==1.5.2
 pandas==2.2.3
 numpy==2.1.2
+# Motor inteligente de enrutamiento y riesgos (Parcial 2).
+tensorflow-cpu==2.18.0
 python-jose[cryptography]==3.3.0
 python-dotenv==1.0.1
 anthropic>=0.40.0,<1.0.0
